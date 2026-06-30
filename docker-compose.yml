@@ -1,0 +1,73 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: imap-spamkiller:local
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      APP_SECRET: ${APP_SECRET:-}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://127.0.0.1:5173,http://localhost:5173}
+      RSPAMD_URL: http://rspamd:11333
+      RSPAMD_SETTINGS_ID: ${RSPAMD_SETTINGS_ID:-}
+      DATA_DIR: /data
+      STATIC_DIR: /app/static
+    volumes:
+      - spamkiller-data:/data
+    depends_on:
+      - rspamd
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: imap-spamkiller:local
+    restart: unless-stopped
+    command: ["python", "-m", "spamkiller.worker"]
+    environment:
+      APP_SECRET: ${APP_SECRET:-}
+      RSPAMD_URL: http://rspamd:11333
+      RSPAMD_SETTINGS_ID: ${RSPAMD_SETTINGS_ID:-}
+      DATA_DIR: /data
+    volumes:
+      - spamkiller-data:/data
+    depends_on:
+      - app
+      - rspamd
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - spamkiller-redis:/data
+
+  unbound:
+    image: mvance/unbound:latest
+    restart: unless-stopped
+    networks:
+      default:
+        ipv4_address: 172.28.53.53
+
+  rspamd:
+    image: rspamd/rspamd:latest
+    restart: unless-stopped
+    volumes:
+      - spamkiller-rspamd:/var/lib/rspamd
+      - ./rspamd/local.d:/etc/rspamd/local.d:ro
+    depends_on:
+      - redis
+      - unbound
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.53.0/24
+
+volumes:
+  spamkiller-data:
+  spamkiller-redis:
+  spamkiller-rspamd:
