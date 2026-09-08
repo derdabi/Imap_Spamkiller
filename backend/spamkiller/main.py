@@ -313,6 +313,9 @@ def confirm_spam(message_id: int, session: Session = Depends(get_session)) -> di
 
     record.status = "confirmed_spam"
     record.updated_at = now_utc()
+    if previous_status != "quarantined" or record.quarantined_at is None:
+        record.quarantined_at = record.updated_at
+    record.deleted_at = None
 
     session.add(AuditEvent(message_id=record.id, event_type="message_confirmed_spam", details={"previous_status": previous_status}))
     session.commit()
@@ -387,6 +390,8 @@ def _llm_read(settings: LlmSettings) -> LlmSettingsRead:
 
 
 def _saved_password_for_payload(current: MailboxSettings, payload: MailboxSettingsUpdate) -> str | None:
+    if payload.password:
+        return None
     if current.encrypted_password and _imap_identity_changed(current, payload):
         raise HTTPException(status_code=400, detail="Enter the mailbox password when changing IMAP host, port, username, or email.")
     return current.encrypted_password

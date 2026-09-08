@@ -29,31 +29,31 @@ def message_received_at(message: Message):
         return None
 
 
+def _body_parts(message: Message):
+    # Do not descend into attached messages or multipart attachment containers.
+    if message.get_content_disposition() == "attachment" or message.get_filename():
+        return
+    if message.get_content_maintype() == "message":
+        return
+    if message.is_multipart():
+        for part in message.get_payload():
+            yield from _body_parts(part)
+    else:
+        yield message
+
+
 def extract_plain_text(message: Message, max_chars: int) -> str:
     parts: list[str] = []
     html_parts: list[str] = []
-    if message.is_multipart():
-        for part in message.walk():
-            if part.get_content_disposition() == "attachment":
-                continue
-            try:
-                content = part.get_content()
-            except Exception:
-                continue
-            if part.get_content_type() == "text/plain":
-                parts.append(content)
-            elif part.get_content_type() == "text/html":
-                html_parts.append(content)
-    elif message.get_content_type() == "text/plain":
+    for part in _body_parts(message):
         try:
-            parts.append(message.get_content())
+            content = part.get_content()
         except Exception:
-            pass
-    elif message.get_content_type() == "text/html":
-        try:
-            html_parts.append(message.get_content())
-        except Exception:
-            pass
+            continue
+        if part.get_content_type() == "text/plain":
+            parts.append(content)
+        elif part.get_content_type() == "text/html":
+            html_parts.append(content)
     if not parts and html_parts:
         parts.extend(_html_to_text(part) for part in html_parts)
     text = "\n".join(parts)

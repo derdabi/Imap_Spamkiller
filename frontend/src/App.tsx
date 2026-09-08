@@ -268,12 +268,13 @@ export function App() {
   }, [llm.provider]);
 
   async function refreshAll(nextNotice = "System is ready.", fallbackEvent?: AuditEvent, nextError = "") {
+    // Settle IMAP separately: saved settings must be usable even while it is slow or offline.
+    const inboxRequest = Promise.allSettled([getInboxMessages()]);
     try {
-      const [mailboxSettings, llmSettings, quarantined, inboxMessages, events] = await Promise.all([
+      const [mailboxSettings, llmSettings, quarantined, events] = await Promise.all([
         getMailboxSettings(),
         getLlmSettings(),
         getQuarantine(),
-        getInboxMessages(),
         getAudit()
       ]);
       const nextAudit = fallbackEvent && !hasScanActivitySince(events, fallbackEvent.created_at) ? [fallbackEvent, ...events] : events;
@@ -285,12 +286,17 @@ export function App() {
         setLlm(normalizedLlmSettings);
         setSavedLlm(normalizedLlmSettings);
         setQuarantine(quarantined);
-        setCheckedInbox(inboxMessages);
         setAudit(nextAudit);
         setNotice(nextNotice);
         setError(nextError);
         void refreshModels(normalizedLlmSettings);
       });
+      const [inboxResult] = await inboxRequest;
+      if (inboxResult.status === "fulfilled") {
+        setCheckedInbox(inboxResult.value);
+      } else {
+        setError(nextError || (inboxResult.reason instanceof Error ? inboxResult.reason.message : "Could not load inbox messages."));
+      }
       return nextAudit;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load data.");
@@ -299,20 +305,16 @@ export function App() {
   }
 
   async function refreshLiveData() {
-    try {
-      const [quarantined, inboxMessages, events] = await Promise.all([
-        getQuarantine(),
-        getInboxMessages(),
-        getAudit()
-      ]);
-      startTransition(() => {
-        setQuarantine(quarantined);
-        setCheckedInbox(inboxMessages);
-        setAudit(events);
-      });
-    } catch {
-      // Keep the current UI state when a background refresh fails.
-    }
+    const [quarantined, inboxMessages, events] = await Promise.allSettled([
+      getQuarantine(),
+      getInboxMessages(),
+      getAudit()
+    ]);
+    startTransition(() => {
+      if (quarantined.status === "fulfilled") setQuarantine(quarantined.value);
+      if (inboxMessages.status === "fulfilled") setCheckedInbox(inboxMessages.value);
+      if (events.status === "fulfilled") setAudit(events.value);
+    });
   }
 
   async function saveMailbox(event: FormEvent) {

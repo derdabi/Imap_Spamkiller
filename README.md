@@ -1,15 +1,58 @@
 # IMAP SpamKiller
 
-Self-hosted spam quarantine for one IMAP mailbox. The first target is a t-online.de mailbox running on a home NAS through Docker Compose or Podman Compose.
+Self-hosted email protection with local Rspamd scoring and optional **LLM-assisted spam and phishing review through OpenAI or Anthropic**. Run it on a NAS or server with Docker Compose or Podman Compose and connect an IMAP mailbox.
 
 ## What It Does
 
-- Checks one IMAP inbox repeatedly.
-- Scores messages with local Rspamd and uses Rspamd actions for quarantine decisions.
-- Optionally asks OpenAI or Anthropic only for uncertain messages.
+- Combines local spam scoring with optional LLM review of uncertain or suspicious messages.
+- Lets you choose OpenAI or Anthropic, select a model, and test the connection from the web UI.
+- Records LLM verdicts, confidence, explanations, and the signals that triggered review in the audit history.
+- Checks one IMAP folder repeatedly, processing previously unscanned messages in batches.
 - Moves high-confidence spam to `SpamKiller/Quarantine`.
 - Lets you restore quarantined messages from the web UI.
 - Automatically deletes quarantined mail after a configurable retention period, default `15` days.
+
+## LLM-Assisted Review
+
+Rspamd scans messages locally first. When cloud review is enabled, SpamKiller can ask an LLM to assess messages that need more context:
+
+- **Borderline scores:** messages between the review and quarantine thresholds, default `4.0` and `6.0`.
+- **Suspicious messages with low scores:** forged-sender signals or combinations of indicators such as sender/reply-to mismatches, hidden Unicode, obfuscated subjects, and suspicious links can also trigger review.
+
+The model returns a `spam`, `clean`, or `unsure` verdict, a confidence value, and a short explanation. A `spam` verdict with confidence of at least `0.75` can move a suspicious message to quarantine. A high-confidence `clean` verdict can resolve a borderline score when no stronger rule requires quarantine or manual review. Low-score messages with suspicious indicators remain marked for review unless classified as high-confidence spam.
+
+For example, a message scoring `4.5` can be quarantined after a confident LLM spam verdict or classified as clean after a confident clean verdict. A message scoring below `4.0` can still receive LLM review if suspicious signals are strong enough. Confidence is the model's reported value, not a guarantee of correctness.
+
+### Enable Cloud Review
+
+1. Open **Settings → Cloud LLM** in the web UI.
+2. Choose **OpenAI** or **Anthropic** and enter an API key for that provider.
+3. Select or enter a model supported by the provider's text classification endpoint. The UI can load available model IDs; not every listed model is suitable for this task.
+4. Choose whether to send a body excerpt, test the connection, and save the LLM settings.
+5. Use **Scan now** to process unscanned mail, or **Reevaluate folder** to apply the current settings to previously scanned messages. Previously restored messages remain protected from automatic quarantine.
+
+Select **Off** to disable cloud classification. Local Rspamd scanning continues to work without an LLM API key.
+
+### What Is Sent to the LLM?
+
+Cloud review sends the subject, sender, reply-to, sender and reply-to domains, extracted link domains, Rspamd score/action/symbols, and detected suspicious indicators. A plain-text body excerpt of up to `12,000` characters is included by default and can be disabled in the UI.
+
+Attachments, including the contents of attached emails, are excluded from the excerpt. Disabling the excerpt still allows email metadata and extracted link domains to be sent. LLM review is optional and disabled by default; when enabled, selected message data leaves your server for the chosen provider.
+
+Email fields are treated as untrusted data. Detected prompt-injection markers are recorded in the audit history and downgrade a model's `clean` verdict to `unsure`. Failed LLM requests do not stop local decision-making, and an LLM clean verdict does not override Rspamd quarantine rules.
+
+## How Quarantine Decisions Work
+
+| Signal | Result |
+| --- | --- |
+| LLM returns `spam` with confidence ≥ `0.75` | Quarantine |
+| Rspamd score reaches the quarantine threshold, or action is `reject`, `quarantine`, or `discard` | Quarantine |
+| Rspamd action is `add header`, `rewrite subject`, `soft reject`, or `greylist` | Manual review, unless a quarantine rule above applies |
+| Borderline score with a high-confidence LLM `clean` verdict | Clean, unless a stronger rule above applies |
+| Borderline score without a decisive LLM result, or low score with strong suspicious indicators | Manual review |
+| Low score without a suspicious-indicator trigger | Clean |
+
+Messages marked for review stay in the scanned folder. You can confirm them as spam from the UI to move them to quarantine and start their retention period. Quarantined messages can be restored from the UI before confirmation; confirming spam removes it from the quarantine list. Automatic deletion uses time spent in quarantine, not the message's original date.
 
 ## Safety Model
 
@@ -27,6 +70,8 @@ docker compose up --build
 ```
 
 Open `http://localhost:8080`.
+
+Enter your mailbox's IMAP host, port, username, and password in the web UI, choose the scan and quarantine folders, test the connection, and enable scanning. Use an app-specific password if your mail provider requires one. To add cloud review, follow [Enable Cloud Review](#enable-cloud-review).
 
 The app creates and stores its own encryption secret in the persistent data folder. It does not use built-in web-user authentication.
 
@@ -62,17 +107,6 @@ The repository also includes a `Containerfile` and `.containerignore` for Podman
 - The app and worker intentionally use the same local image name: `imap-spamkiller:local`.
 - Keep the app LAN-only unless you have added HTTPS and a hardened reverse-proxy setup.
 
-## Cloud LLM
-
-Supported providers:
-
-- OpenAI
-- Anthropic
-
-The LLM is only used when the Rspamd score is between the review threshold and the quarantine threshold and Rspamd did not already return a spam action. By default, the app sends subject, sender, reply-to, link domains, Rspamd symbols, and a short plain-text body excerpt. LLM responses are normalized to the allowed verdicts, malformed responses become `unsure`, and detected prompt-injection markers downgrade any LLM `clean` verdict to `unsure`.
-
-Default thresholds are `4.0` for review and `6.0` for quarantine. Rspamd actions such as `add header`, `rewrite subject`, `reject`, `quarantine`, or `discard` are quarantined even if the numeric score is lower.
-
 ## NAS Deployment
 
 1. Install Docker, Container Manager, or Podman on the NAS.
@@ -101,7 +135,8 @@ React UI -> FastAPI app -> SQLite volume
 
 - Single mailbox only by design.
 - Restore and auto-delete identify quarantined mail by `Message-ID`; unusual messages without that header may require manual handling in the mail client.
-- Built-in authentication is intentionally simple. Use HTTPS and a reverse proxy before any remote exposure.
+- IMAP connections use TLS and password login; OAuth-only mailbox authentication is not implemented. Safe message moves and deletion require the server to advertise `UIDPLUS`.
+- There is no built-in web-user authentication. Use authentication and HTTPS at the reverse proxy or network layer before any remote exposure.
 - Rspamd learning hooks are not wired yet; confirmation events are stored for the next iteration.
 
 ## Help
@@ -116,6 +151,18 @@ This is only needed to hack on the code or run the tests. To just run the app, u
 - **Windows:** `./start-debug.ps1` sets up the same environment and launches the backend and frontend dev servers (use `-SkipInstall` on later runs).
 
 The Vite dev server proxies `/api` to the backend, so open the frontend URL during development.
+
+With backend dependencies installed, run the regression tests from the `backend` directory:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Build and type-check the frontend from the repository root:
+
+```bash
+npm --prefix frontend run build
+```
 
 ## License
 

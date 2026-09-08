@@ -69,7 +69,7 @@ FINANCIAL_OFFER_SUBJECT_RE = re.compile(
 CLICK_PRESSURE_SUBJECT_RE = re.compile(r"\b(klicken|click|link|bestätigen|verify|activate|anmeldung|aktualisieren|login|anmelden)\b", re.IGNORECASE)
 PERCENT_OFF_RE = re.compile(r"\b\d{1,3}\s*%\b")
 WEAK_PHISHING_INDICATORS = {"message_id_domain_not_fqdn"}
-REMOVED_FROM_QUARANTINE_STATUSES = {"restored", "deleted", "removed_from_quarantine"}
+REMOVED_FROM_QUARANTINE_STATUSES = {"restored", "removed_from_quarantine"}
 SUSPICIOUS_SIGNAL_THRESHOLD = 3.0
 SUSPICIOUS_INDICATOR_WEIGHTS = {
     "subject_hidden_unicode_controls": 3.2,
@@ -200,8 +200,20 @@ async def scan_once(session: Session, trigger: str = "scheduled", *, reevaluate_
         try:
             client = imap_client.connect(mailbox)
             imap_client.ensure_folder(client, mailbox.quarantine_folder)
-            uidvalidity, uids, folder_message_count = imap_client.list_recent_uids(client, mailbox.inbox_folder, None if scan_all else settings.scan_batch_size)
-            candidate_count = len(uids)
+            uidvalidity, uids, folder_message_count = imap_client.list_recent_uids(client, mailbox.inbox_folder, None)
+            if not reevaluate_existing:
+                processed_uids = set(session.scalars(
+                    select(MessageRecord.source_uid).where(MessageRecord.source_folder == mailbox.inbox_folder)
+                ))
+                pending_uids = [uid for uid in uids if f"{uidvalidity}:{uid}" not in processed_uids]
+                skipped_existing = len(uids) - len(pending_uids)
+                if not scan_all:
+                    # Process the oldest outstanding messages first so incoming mail
+                    # cannot keep an existing backlog outside the batch forever.
+                    pending_uids = pending_uids[:settings.scan_batch_size]
+            else:
+                pending_uids = uids if scan_all else uids[:settings.scan_batch_size]
+            candidate_count = len(pending_uids)
             session.add(
                 AuditEvent(
                     event_type="scan_mailbox_checked",
@@ -218,7 +230,7 @@ async def scan_once(session: Session, trigger: str = "scheduled", *, reevaluate_
             if scan_all:
                 missing_from_folder = _mark_missing_folder_records(session, mailbox.inbox_folder, {f"{uidvalidity}:{uid}" for uid in uids})
                 session.commit()
-            for uid in uids:
+            for uid in pending_uids:
                 source_uid = f"{uidvalidity}:{uid}"
                 exists = session.scalar(select(MessageRecord).where(MessageRecord.source_folder == mailbox.inbox_folder, MessageRecord.source_uid == source_uid))
                 if exists and _was_removed_from_quarantine(exists):
