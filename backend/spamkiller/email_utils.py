@@ -61,8 +61,18 @@ def extract_plain_text(message: Message, max_chars: int) -> str:
 
 
 def extract_link_domains(text: str) -> list[str]:
-    domains = {match.group(1).lower().removeprefix("www.") for match in DOMAIN_RE.finditer(text)}
+    domains = {_link_host(match.group(1)) for match in DOMAIN_RE.finditer(text)}
+    domains.discard("")
     return sorted(domains)[:20]
+
+
+def _link_host(authority: str) -> str:
+    host = authority.rsplit("@", 1)[-1].lower()
+    if host.startswith("["):
+        host = host.split("]", 1)[0] + "]"
+    else:
+        host = host.split(":", 1)[0]
+    return host.rstrip(".").removeprefix("www.")
 
 
 def _html_to_text(value: str) -> str:

@@ -15,16 +15,20 @@ class RspamdResult:
     score: float
     action: str
     symbols: dict
+    source_ip: str | None = None
 
 
 _IP_LITERAL_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])|(?<=\[)[0-9a-fA-F:.]{3,}(?=\])")
+_RECEIVED_BY_RE = re.compile(r"\sby\s", re.IGNORECASE)
+MAX_INTERNAL_RECEIVED_HOPS = 5
 
 
 async def scan_with_rspamd(raw_message: bytes, *, rcpt: str | None = None) -> RspamdResult:
     settings = get_settings()
     url = settings.rspamd_url.rstrip("/") + "/checkv2"
     headers = {"Content-Type": "message/rfc822"}
-    headers.update(extract_scan_metadata(raw_message, rcpt=rcpt))
+    metadata = extract_scan_metadata(raw_message, rcpt=rcpt)
+    headers.update(metadata)
     if settings.rspamd_settings_id:
         headers["Settings-ID"] = settings.rspamd_settings_id
     async with httpx.AsyncClient(timeout=30) as client:
@@ -35,6 +39,7 @@ async def scan_with_rspamd(raw_message: bytes, *, rcpt: str | None = None) -> Rs
         score=float(payload.get("score", 0.0) or 0.0),
         action=str(payload.get("action", "no action")),
         symbols=payload.get("symbols", {}) or {},
+        source_ip=metadata.get("IP"),
     )
 
 
@@ -70,17 +75,20 @@ def extract_public_source_ip(raw_message: bytes) -> str | None:
 
 
 def _trusted_source_ip_from_message(message) -> str | None:
+    # Without a client IP Rspamd treats the message as local and skips SPF, DKIM, DMARC and RBL checks.
+    # The newest Received headers come from the provider's own relays (e.g. t-online's internal 10.x hops),
+    # so skip hops without a public sender IP; the first public one is what the provider's MX saw.
+    # Headers below that hop can be forged by the sender and are never consulted.
     received_headers = message.get_all("Received", []) or []
-    if not received_headers:
-        return None
-
-    for value in _IP_LITERAL_RE.findall(str(received_headers[0])):
-        try:
-            address = ipaddress.ip_address(value)
-        except ValueError:
-            continue
-        if address.is_global:
-            return str(address)
+    for header in received_headers[:MAX_INTERNAL_RECEIVED_HOPS]:
+        from_part = _RECEIVED_BY_RE.split(str(header), maxsplit=1)[0]
+        for value in _IP_LITERAL_RE.findall(from_part):
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError:
+                continue
+            if address.is_global:
+                return str(address)
     return None
 
 

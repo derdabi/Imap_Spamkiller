@@ -6,3 +6,6 @@
 frontend/dist
 spamkiller-data
 rspamd-data
+.venv
+.debug-data
+frontend/tsconfig.tsbuildinfo

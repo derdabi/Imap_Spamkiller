@@ -15,10 +15,13 @@ class Decision:
     explanation: str
 
 
-def decide(settings: MailboxSettings, rspamd: RspamdResult, llm: LlmVerdict, *, llm_trigger: str | None = None) -> Decision:
+def decide(settings: MailboxSettings, rspamd: RspamdResult, llm: LlmVerdict, *, llm_trigger: str | None = None, local_spam_reason: str | None = None) -> Decision:
     action = rspamd.action.strip().lower()
     if action == "unavailable":
         return Decision("review", "Rspamd could not scan this message, so it was left in the inbox.")
+
+    if local_spam_reason:
+        return Decision("spam", f"Local phishing rule: {local_spam_reason}.")
 
     if llm.verdict == "spam" and llm.confidence >= 0.75:
         return Decision("spam", f"{llm.provider} marked suspicious message as spam: {llm.reason}")

@@ -9,3 +9,5 @@ frontend/dist/
 *.db
 *.sqlite
 frontend/tsconfig.tsbuildinfo
+update-nas-docker.ps1
+docker-compose.override.yml

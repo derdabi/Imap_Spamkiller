@@ -1,4 +1,4 @@
-import { FormEvent, ReactNode, useEffect, useState, useTransition } from "react";
+import { FormEvent, ReactNode, useEffect, useRef, useState, useTransition } from "react";
 import { Bot, CheckCircle2, Clock, MailCheck, RefreshCw, ShieldCheck, Trash2, Undo2 } from "lucide-react";
 import {
   AuditEvent,
@@ -243,6 +243,9 @@ export function App() {
   const [wizardDismissed, setWizardDismissed] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const [isReevaluating, setIsReevaluating] = useState(false);
+  const [lastLiveRefreshAt, setLastLiveRefreshAt] = useState<Date | null>(null);
+  const [liveRefreshError, setLiveRefreshError] = useState("");
+  const liveDataRequest = useRef(0);
   const [isPending, startTransition] = useTransition();
   const hasUnreadableCredentials = mailbox.password_unreadable || llm.api_key_unreadable;
   const displayedFolderOptions = [...new Set([
@@ -259,8 +262,18 @@ export function App() {
     const intervalId = window.setInterval(() => {
       void refreshLiveData();
     }, AUTO_REFRESH_MS);
+    // Browsers throttle timers in background tabs, so refresh as soon as the tab is visible again.
+    const refreshWhenVisible = () => {
+      if (!document.hidden) {
+        void refreshLiveData();
+      }
+    };
+    document.addEventListener("visibilitychange", refreshWhenVisible);
 
-    return () => window.clearInterval(intervalId);
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
   }, []);
 
   useEffect(() => {
@@ -268,6 +281,8 @@ export function App() {
   }, [llm.provider]);
 
   async function refreshAll(nextNotice = "System is ready.", fallbackEvent?: AuditEvent, nextError = "") {
+    // Invalidate background refreshes that started earlier so they can't overwrite this newer data.
+    liveDataRequest.current += 1;
     // Settle IMAP separately: saved settings must be usable even while it is slow or offline.
     const inboxRequest = Promise.allSettled([getInboxMessages()]);
     try {
@@ -294,8 +309,10 @@ export function App() {
       const [inboxResult] = await inboxRequest;
       if (inboxResult.status === "fulfilled") {
         setCheckedInbox(inboxResult.value);
+        setLiveRefreshError("");
+        setLastLiveRefreshAt(new Date());
       } else {
-        setError(nextError || (inboxResult.reason instanceof Error ? inboxResult.reason.message : "Could not load inbox messages."));
+        setLiveRefreshError(`Could not load inbox messages, showing older data: ${inboxResult.reason instanceof Error ? inboxResult.reason.message : String(inboxResult.reason)}`);
       }
       return nextAudit;
     } catch (err) {
@@ -305,16 +322,28 @@ export function App() {
   }
 
   async function refreshLiveData() {
+    const requestId = ++liveDataRequest.current;
+    // Settle each request on its own: the inbox needs an IMAP login and must not block quarantine/audit updates.
     const [quarantined, inboxMessages, events] = await Promise.allSettled([
       getQuarantine(),
       getInboxMessages(),
       getAudit()
     ]);
+    if (requestId !== liveDataRequest.current) {
+      return;
+    }
     startTransition(() => {
       if (quarantined.status === "fulfilled") setQuarantine(quarantined.value);
       if (inboxMessages.status === "fulfilled") setCheckedInbox(inboxMessages.value);
       if (events.status === "fulfilled") setAudit(events.value);
     });
+    const failure = [quarantined, inboxMessages, events].find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) {
+      setLiveRefreshError(`Live refresh failed, showing older data: ${failure.reason instanceof Error ? failure.reason.message : String(failure.reason)}`);
+    } else {
+      setLiveRefreshError("");
+      setLastLiveRefreshAt(new Date());
+    }
   }
 
   async function saveMailbox(event: FormEvent) {
@@ -636,6 +665,7 @@ export function App() {
 
       {notice && <div className="notice">{notice}</div>}
       {error && <div className="error">{error}</div>}
+      {liveRefreshError && <div className="error">{liveRefreshError}</div>}
       {hasUnreadableCredentials && (
         <section className="warningPanel">
           <div>
@@ -732,7 +762,7 @@ export function App() {
                     </select>
                   </label>
                 ) : (
-                  <label>Model<input value={llm.model} placeholder={llm.provider === "anthropic" ? "claude-3-5-haiku-latest" : "gpt-4.1-mini"} onChange={(event) => setLlm({ ...llm, model: event.target.value })} /></label>
+                  <label>Model<input value={llm.model} placeholder={llm.provider === "anthropic" ? "claude-haiku-5-5" : "gpt-4.1-mini"} onChange={(event) => setLlm({ ...llm, model: event.target.value })} /></label>
                 )}
                 <label>API key<input type="password" value={apiKey} placeholder={llm.has_api_key ? "Saved, enter only to replace" : "Required for cloud LLM"} onChange={(event) => setApiKey(event.target.value)} /></label>
               </FieldRow>
@@ -765,7 +795,10 @@ export function App() {
 
       <section className="panel">
         <h2>Current Inbox</h2>
-        <p className="muted">Messages currently in <strong>{mailbox.inbox_folder || "the checked folder"}</strong> with saved scan information.</p>
+        <p className="muted">
+          Messages currently in <strong>{mailbox.inbox_folder || "the checked folder"}</strong> with saved scan information.
+          {lastLiveRefreshAt ? ` Updated ${lastLiveRefreshAt.toLocaleTimeString()}.` : ""}
+        </p>
         <div className="messageList">
           {checkedInbox.length === 0 && <p className="muted">No scanned current inbox messages found. Run Reevaluate folder to scan everything currently there.</p>}
           {checkedInbox.map((message) => (

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import math
 import os
 import re
@@ -8,7 +9,7 @@ from datetime import timedelta
 from email.utils import getaddresses
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -22,6 +23,8 @@ from .rspamd import scan_with_rspamd
 
 
 SCAN_LOCK_STALE_SECONDS = 6 * 60 * 60
+# Scan-level audit events (no message attached) are written on every poll; per-message history is kept.
+SCAN_AUDIT_RETENTION_DAYS = 30
 SUSPICIOUS_LLM_SYMBOLS = {
     "ARC_REJECT",
     "CTYPE_MIXED_BOGUS",
@@ -37,6 +40,9 @@ SUSPICIOUS_LLM_SYMBOLS = {
     "SUBJECT_NEEDS_ENCODING",
     "ZERO_FONT",
 }
+DISPLAY_NAME_DOMAIN_RE = re.compile(r"[\w.+-]+@((?:[a-z0-9-]+\.)+[a-z]{2,24})\b", re.IGNORECASE)
+# DMARC pass means the From domain is authenticated, so envelope/From differences are just a bulk-mail relay.
+DMARC_PASS_SYMBOLS = {"DMARC_POLICY_ALLOW"}
 OBFUSCATED_WORD_RE = re.compile(r"\b[A-Za-z]{1,3}\.[A-Za-z]{2,}\b")
 FREEMAIL_DOMAINS = {
     "aol.com",
@@ -69,6 +75,7 @@ FINANCIAL_OFFER_SUBJECT_RE = re.compile(
 CLICK_PRESSURE_SUBJECT_RE = re.compile(r"\b(klicken|click|link|bestätigen|verify|activate|anmeldung|aktualisieren|login|anmelden)\b", re.IGNORECASE)
 PERCENT_OFF_RE = re.compile(r"\b\d{1,3}\s*%\b")
 WEAK_PHISHING_INDICATORS = {"message_id_domain_not_fqdn"}
+# Auto-deleted spam ("deleted") is not a user decision, so it must not suppress future quarantine.
 REMOVED_FROM_QUARANTINE_STATUSES = {"restored", "removed_from_quarantine"}
 SUSPICIOUS_SIGNAL_THRESHOLD = 3.0
 SUSPICIOUS_INDICATOR_WEIGHTS = {
@@ -83,9 +90,12 @@ SUSPICIOUS_INDICATOR_WEIGHTS = {
     "freemail_sender_with_institution_claim": 1.8,
     "institution_claim_with_external_link_domain": 1.8,
     "sender_display_domain_mismatch": 2.2,
+    "sender_display_name_impersonates_domain": 2.2,
     "subject_encoding_finance_offer": 2.2,
 }
 SUSPICIOUS_INDICATOR_DEFAULT_WEIGHT = 1.0
+
+logger = logging.getLogger(__name__)
 
 
 def _try_acquire_scan_lock() -> Path | None:
@@ -198,9 +208,10 @@ async def scan_once(session: Session, trigger: str = "scheduled", *, reevaluate_
         folder_message_count = None
         uidvalidity = "unknown"
         try:
-            client = imap_client.connect(mailbox)
-            imap_client.ensure_folder(client, mailbox.quarantine_folder)
-            uidvalidity, uids, folder_message_count = imap_client.list_recent_uids(client, mailbox.inbox_folder, None)
+            # imaplib is blocking; run it in a thread so manual scans don't stall the API event loop.
+            client = await asyncio.to_thread(imap_client.connect, mailbox)
+            await asyncio.to_thread(imap_client.ensure_folder, client, mailbox.quarantine_folder)
+            uidvalidity, uids, folder_message_count = await asyncio.to_thread(imap_client.list_recent_uids, client, mailbox.inbox_folder, None)
             if not reevaluate_existing:
                 processed_uids = set(session.scalars(
                     select(MessageRecord.source_uid).where(MessageRecord.source_folder == mailbox.inbox_folder)
@@ -240,7 +251,7 @@ async def scan_once(session: Session, trigger: str = "scheduled", *, reevaluate_
                     skipped_existing += 1
                     continue
                 try:
-                    raw = imap_client.fetch_raw(client, uid)
+                    raw = await asyncio.to_thread(imap_client.fetch_raw, client, uid)
                     result = await scan_message(session, mailbox, raw, source_uid, existing_record=exists)
                 except IntegrityError:
                     session.rollback()
@@ -260,7 +271,7 @@ async def scan_once(session: Session, trigger: str = "scheduled", *, reevaluate_
                         session.commit()
                         continue
                     try:
-                        imap_client.move_uid(client, mailbox.inbox_folder, uid, mailbox.quarantine_folder)
+                        await asyncio.to_thread(imap_client.move_uid, client, mailbox.inbox_folder, uid, mailbox.quarantine_folder)
                     except Exception as exc:
                         session.rollback()
                         failed += 1
@@ -281,6 +292,7 @@ async def scan_once(session: Session, trigger: str = "scheduled", *, reevaluate_
                 else:
                     clean += 1
                 session.commit()
+            # Runs on the loop thread: it shares the session, and only touches IMAP for expired records.
             deleted = delete_expired_quarantine(session, client, mailbox)
             result = {
                 "folder": mailbox.inbox_folder,
@@ -317,7 +329,7 @@ async def scan_once(session: Session, trigger: str = "scheduled", *, reevaluate_
             session.commit()
             raise
         finally:
-            imap_client.logout_quietly(client)
+            await asyncio.to_thread(imap_client.logout_quietly, client)
     finally:
         _release_scan_lock(scan_lock)
 
@@ -406,7 +418,8 @@ async def scan_message(session: Session, mailbox: MailboxSettings, raw: bytes, u
         sender=record.sender,
         suspicious_indicators=suspicious_indicators,
     )
-    if llm_trigger:
+    spam_reason = local_spam_reason(suspicious_indicators)
+    if llm_trigger and not spam_reason:
         features = {
             "subject": record.subject,
             "from": record.sender,
@@ -427,7 +440,7 @@ async def scan_message(session: Session, mailbox: MailboxSettings, raw: bytes, u
         except Exception as exc:
             llm = LlmVerdict("skipped", 0.0, f"LLM classification failed: {exc}", llm_settings.provider)
 
-    decision = decide(mailbox, rspamd, llm, llm_trigger=llm_trigger)
+    decision = decide(mailbox, rspamd, llm, llm_trigger=llm_trigger, local_spam_reason=spam_reason)
     record.final_verdict = decision.verdict
     record.explanation = decision.explanation
     record.status = "scanned" if decision.verdict != "spam" else "pending_quarantine"
@@ -457,6 +470,7 @@ async def scan_message(session: Session, mailbox: MailboxSettings, raw: bytes, u
         "uncertain_score_threshold": mailbox.uncertain_score_threshold,
         "spam_score_threshold": mailbox.spam_score_threshold,
         "rspamd_symbols": _top_rspamd_symbols(rspamd.symbols),
+        "rspamd_source_ip": rspamd.source_ip or "none",
         "llm_provider": llm.provider,
         "llm_verdict": llm.verdict,
         "llm_confidence": llm.confidence,
@@ -515,9 +529,13 @@ def _collect_suspicious_signals(
     suspicious_signals: list[str] = []
     signal_score = 0.0
 
-    if "FORGED_SENDER" in symbols:
+    dmarc_passed = bool(DMARC_PASS_SYMBOLS & symbols)
+
+    # FORGED_SENDER only means envelope sender != From, which is normal for newsletters and shop mail
+    # sent through an ESP, so it needs other evidence before it triggers review.
+    if "FORGED_SENDER" in symbols and not dmarc_passed:
         suspicious_signals.append("forged_sender")
-        signal_score += 4.0
+        signal_score += 2.0
 
     if {"DATE_IN_PAST", "MIME_HTML_ONLY"}.issubset(symbols) and rspamd.score >= 1.0:
         suspicious_signals.append("date_in_past_mime_html_only")
@@ -547,7 +565,7 @@ def _collect_suspicious_signals(
         suspicious_signals.append("mid_rhs_not_fqdn_missing_mime_version")
         signal_score += 1.8
 
-    if rspamd.score >= 2.0 and {"ARC_REJECT", "FORGED_SENDER", "FROM_NEQ_ENVFROM"} & symbols:
+    if rspamd.score >= 2.0 and not dmarc_passed and "ARC_REJECT" in symbols and {"FORGED_SENDER", "FROM_NEQ_ENVFROM"} & symbols:
         suspicious_signals.append("multi_symbol_cluster")
         signal_score += 2.1
 
@@ -570,7 +588,7 @@ def _collect_suspicious_signals(
     if not suspicious_signals:
         return None, [], 0.0
 
-    if signal_score >= SUSPICIOUS_SIGNAL_THRESHOLD or "forged_sender" in suspicious_signals:
+    if signal_score >= SUSPICIOUS_SIGNAL_THRESHOLD:
         if len(suspicious_signals) > 4:
             suspicious_signals = suspicious_signals[:4]
         return "suspicious_signals:" + "+".join(suspicious_signals), suspicious_signals, round(signal_score, 2)
@@ -607,6 +625,8 @@ def local_phishing_indicators(rspamd, *, subject: str = "", sender: str = "", re
         indicators.append("sender_domain_suspicious")
     if _sender_display_name_mismatches_domain(sender_name, sender_domain):
         indicators.append("sender_display_domain_mismatch")
+    if _display_name_impersonates_domain(sender_name, sender_domain):
+        indicators.append("sender_display_name_impersonates_domain")
     if _subject_has_financial_offer(subject) and "SUBJECT_NEEDS_ENCODING" in symbols and "subject_encoding_finance_offer" not in indicators:
         indicators.append("subject_encoding_finance_offer")
     if has_institution_claim and sender_domain and link_domains:
@@ -617,6 +637,22 @@ def local_phishing_indicators(rspamd, *, subject: str = "", sender: str = "", re
         indicators.append("message_id_domain_not_fqdn")
 
     return list(dict.fromkeys(indicators))
+
+
+def local_spam_reason(suspicious_indicators: list[str]) -> str | None:
+    # A display name that names a different domain *and* hides invisible control characters
+    # (e.g. "nor\u200feply@ba\u200fnk.example" <x@outlook.com>) is impersonation; legitimate senders do neither.
+    if "sender_display_name_impersonates_domain" in suspicious_indicators and "sender_hidden_unicode_controls" in suspicious_indicators:
+        return "sender display name impersonates another domain using hidden control characters"
+    return None
+
+
+def _display_name_impersonates_domain(sender_name: str, sender_domain: str) -> bool:
+    if not sender_name or not sender_domain:
+        return False
+    visible_name = "".join(char for char in sender_name if unicodedata.category(char) != "Cf")
+    claimed = [match.group(1).lower() for match in DISPLAY_NAME_DOMAIN_RE.finditer(visible_name)]
+    return any(not _domains_match(domain, sender_domain) for domain in claimed)
 
 
 def _subject_has_marketing_pressure(subject: str) -> bool:
@@ -775,13 +811,26 @@ def delete_expired_quarantine(session: Session, client, mailbox: MailboxSettings
     return deleted
 
 
+def prune_scan_audit_events(session: Session) -> int:
+    cutoff = now_utc() - timedelta(days=SCAN_AUDIT_RETENTION_DAYS)
+    result = session.execute(delete(AuditEvent).where(AuditEvent.message_id.is_(None), AuditEvent.created_at < cutoff))
+    session.commit()
+    return result.rowcount or 0
+
+
 async def worker_loop(session_factory) -> None:
     while True:
         with session_factory() as session:
             mailbox = get_or_create_mailbox_settings(session)
             try:
                 await scan_once(session)
-            except Exception as exc:
+            except Exception:
                 session.rollback()
+                logger.exception("Scheduled scan failed.")
+            try:
+                prune_scan_audit_events(session)
+            except Exception:
+                session.rollback()
+                logger.exception("Pruning old audit events failed.")
             sleep_for = max(60, mailbox.poll_interval_seconds)
         await asyncio.sleep(sleep_for)

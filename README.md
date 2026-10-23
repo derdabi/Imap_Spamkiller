@@ -17,7 +17,7 @@ Self-hosted email protection with local Rspamd scoring and optional **LLM-assist
 Rspamd scans messages locally first. When cloud review is enabled, SpamKiller can ask an LLM to assess messages that need more context:
 
 - **Borderline scores:** messages between the review and quarantine thresholds, default `4.0` and `6.0`.
-- **Suspicious messages with low scores:** forged-sender signals or combinations of indicators such as sender/reply-to mismatches, hidden Unicode, obfuscated subjects, and suspicious links can also trigger review.
+- **Suspicious messages with low scores:** combinations of indicators such as sender/reply-to mismatches, hidden Unicode, obfuscated subjects, display names that impersonate another domain, and suspicious links can also trigger review. An envelope sender that differs from `From` (normal for newsletters and shop mail) only counts when DMARC did not pass and other indicators are present.
 
 The model returns a `spam`, `clean`, or `unsure` verdict, a confidence value, and a short explanation. A `spam` verdict with confidence of at least `0.75` can move a suspicious message to quarantine. A high-confidence `clean` verdict can resolve a borderline score when no stronger rule requires quarantine or manual review. Low-score messages with suspicious indicators remain marked for review unless classified as high-confidence spam.
 
@@ -45,6 +45,7 @@ Email fields are treated as untrusted data. Detected prompt-injection markers ar
 
 | Signal | Result |
 | --- | --- |
+| Sender display name names another domain *and* hides invisible control characters (for example `"noreply@bank.example" <x@freemail.example>` with invisible characters inside the name) | Quarantine, without asking the LLM |
 | LLM returns `spam` with confidence ≥ `0.75` | Quarantine |
 | Rspamd score reaches the quarantine threshold, or action is `reject`, `quarantine`, or `discard` | Quarantine |
 | Rspamd action is `add header`, `rewrite subject`, `soft reject`, or `greylist` | Manual review, unless a quarantine rule above applies |
@@ -61,6 +62,7 @@ Messages marked for review stay in the scanned folder. You can confirm them as s
 - Auto-delete only applies to messages already in quarantine and older than the configured retention period.
 - Cloud LLM classification is disabled by default.
 - Attachments are never sent to cloud LLMs.
+- SpamKiller passes the sending server's IP from the mail provider's own `Received` headers to Rspamd, so SPF, DKIM, DMARC and reputation checks run. Headers added further down by the sender are never trusted.
 - Email content is treated as untrusted data. Prompt-injection-like text in a message is flagged, included in audit details, and prevents the LLM from turning an uncertain message into a trusted clean verdict.
 
 ## Quick Start With Docker
@@ -141,7 +143,7 @@ React UI -> FastAPI app -> SQLite volume
 
 ## Help
 
-The web UI has a **Help** button in the top-right corner that explains what the app does, how scoring decisions are made, and how to set it up. Most fields and buttons also show a short explanation on hover.
+On first start the web UI opens a setup wizard for the mailbox. Several settings show a short explanation on hover, and **Recent Activity** lists every scan and decision with the signals behind it.
 
 ## Local Development
 

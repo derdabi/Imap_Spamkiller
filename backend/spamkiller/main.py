@@ -313,6 +313,8 @@ def confirm_spam(message_id: int, session: Session = Depends(get_session)) -> di
 
     record.status = "confirmed_spam"
     record.updated_at = now_utc()
+    # Auto-delete keys on quarantined_at: start the clock when the message enters quarantine now,
+    # but keep the original start for mail that was already quarantined.
     if previous_status != "quarantined" or record.quarantined_at is None:
         record.quarantined_at = record.updated_at
     record.deleted_at = None

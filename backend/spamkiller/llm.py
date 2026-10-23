@@ -44,8 +44,22 @@ def _default_model(provider: str) -> str:
     if provider == "openai":
         return "gpt-4.1-mini"
     if provider == "anthropic":
-        return "claude-3-5-haiku-latest"
+        return "claude-haiku-5-5"
     return ""
+
+
+def _raise_for_status(response: httpx.Response) -> None:
+    # httpx's default message omits the body, which is where OpenAI/Anthropic explain a 4xx.
+    if response.is_success:
+        return
+    detail = response.text.strip()
+    try:
+        error = response.json().get("error")
+        if isinstance(error, dict) and error.get("message"):
+            detail = str(error["message"])
+    except ValueError:
+        pass
+    raise RuntimeError(f"{response.status_code} {response.reason_phrase} from {response.url.host}: {detail[:300]}")
 
 
 def _extract_model_ids(payload: dict) -> list[str]:
@@ -196,7 +210,7 @@ async def _classify_openai(api_key: str, model: str, user_prompt: str) -> LlmVer
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=45) as client:
         response = await client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
-        response.raise_for_status()
+        _raise_for_status(response)
         text = response.json()["choices"][0]["message"]["content"]
     return _parse_llm_verdict(text, "openai")
 
@@ -210,14 +224,15 @@ async def _test_openai(api_key: str, model: str) -> None:
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
-        response.raise_for_status()
+        _raise_for_status(response)
 
 
 async def _classify_anthropic(api_key: str, model: str, user_prompt: str) -> LlmVerdict:
     payload = {
         "model": model,
-        "max_tokens": 400,
-        "temperature": 0,
+        # No temperature: current Claude models reject non-default sampling values with a 400.
+        # Thinking is on by default and counts toward max_tokens, so leave room before the JSON answer.
+        "max_tokens": 4096,
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": user_prompt}],
     }
@@ -226,11 +241,14 @@ async def _classify_anthropic(api_key: str, model: str, user_prompt: str) -> Llm
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
     }
-    async with httpx.AsyncClient(timeout=45) as client:
+    async with httpx.AsyncClient(timeout=90) as client:
         response = await client.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers)
-        response.raise_for_status()
-        content = response.json().get("content", [])
+        _raise_for_status(response)
+        payload = response.json()
+    content = payload.get("content", [])
     text = "".join(block.get("text", "") for block in content if block.get("type") == "text")
+    if not text.strip():
+        return LlmVerdict("unsure", 0.0, f"LLM returned no answer (stop_reason={payload.get('stop_reason')}).", "anthropic")
     return _parse_llm_verdict(text, "anthropic")
 
 
@@ -247,14 +265,14 @@ async def _test_anthropic(api_key: str, model: str) -> None:
     }
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers)
-        response.raise_for_status()
+        _raise_for_status(response)
 
 
 async def _list_openai_models(api_key: str) -> list[str]:
     headers = {"Authorization": f"Bearer {api_key}"}
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.get("https://api.openai.com/v1/models", headers=headers)
-        response.raise_for_status()
+        _raise_for_status(response)
     return _extract_model_ids(response.json())
 
 
@@ -265,5 +283,5 @@ async def _list_anthropic_models(api_key: str) -> list[str]:
     }
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.get("https://api.anthropic.com/v1/models", headers=headers)
-        response.raise_for_status()
+        _raise_for_status(response)
     return _extract_model_ids(response.json())

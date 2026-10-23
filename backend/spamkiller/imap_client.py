@@ -172,7 +172,7 @@ def logout_quietly(client: imaplib.IMAP4_SSL | None) -> None:
 
 
 def _quote(value: str) -> str:
-    escaped = value.replace('"', '\\"')
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
 
 
@@ -226,4 +226,6 @@ def _parse_list_folder(line: str) -> str:
     match = re.search(r'\s(?:"((?:\\.|[^"\\])*)"|([^\s]+))$', line)
     if not match:
         return ""
-    return (match.group(1) or match.group(2) or "").replace('\\"', '"')
+    if match.group(1) is not None:
+        return re.sub(r"\\(.)", r"\1", match.group(1))
+    return match.group(2) or ""
